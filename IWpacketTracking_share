@@ -1,0 +1,660 @@
+function IWpacketTracking_share
+% Copyright Susan K Willis 02/19/2014 
+
+% This function indentifies internal wave packets from moored temperature
+% data (for example, multiple weeks at a single mooring, outfitted with
+% multiple thermistors). It identifies internal waves as troughs- local
+% minima in temperature at a given depth in the water column; it is tuned
+% for internal waves on the inner shelf. Higher vertical resolution of
+% temperature profiles yields truer results. Displacement of the wave from
+% a background isotherm location is described by "error bars", which can be
+% used with MATLAB's built-in error bar plotting tool. 
+
+% Input data required:
+% Temperature (z) as a function of time (x, each column a different time) 
+% and depth (y, each row a different location in the vertical)
+% Time, a row vector of the same size as Temperature's rows; assumed
+% constant time spacing, which is the primary input; can limit analysis
+% period with specific start and end times
+% Vertical location of temperature sensors in the water column (assumed
+% constant throughout the time period)
+
+% We are using 1-min Ri calcs as the cutoff frequency for internal waves and the
+% original data field (timeseries of temperature) instead of isotherms,
+% because the isotherm displacements give no clear isotherm of max
+% displacement
+%%Define Data Set
+secbtwsamples = 10; %time between samples, sec
+permin=60/secbtwsamples; %samples per minute
+timeorig = Jtime10s; %input timeseries
+bottom = 186; %beginning time (yearday)
+top= 187; %ending time (yearday)
+maxthermoclinedepth = 10; %pre-set maximum depth at which to identify thermocline
+absoluteminperiod = 1;%minimum period of internal waves
+minperiod = absoluteminperiod*60/secbtwsamples;%# of samples for check
+%%if using filtered data
+minsforbkgd = 1;%should be less than or equal to minimum period
+hrsforbkgd= minsforbkgd/60;
+bkgdhrs = 2; %averaging period to determine "background" from which internal waves are displacing water column
+%this is period for moving average filter
+
+mintime = find(timeorig>bottom,1,'first'); %data point to begin with
+maxtime = find(timeorig>top,1,'first')-1; %data point to end with
+timeorig = timeorig(mintime:maxtime); %corresponding time data
+dataorig = CJTherms(:, mintime:maxtime); %temperature data providing isotherms x = time y=depth
+depthsorig = CJmab;% locations, mab, of temperature sensors; column vector
+tempdat = dataorig; %want to reuse dataorig so tempdat is for playing
+
+
+contourlevels = 10.0:0.25:15.5;%temperature contour levels desired
+minspacinginterp = 0.25;
+
+%% Get Contour data
+[disploc,displamt, locm, locMAm] =IsothermDisplacements(dataorig, timeorig, depthsorig,secbtwsamples,bkgdhrs,minsforbkgd,contourlevels);
+%% Quick filter data
+%remove if unnecessary
+% [dataorig,~]=movingavgfilt(dataorig,secbtwsamples,hrsforbkgd);
+[hrMA,~] = movingavgfilt(dataorig, secbtwsamples, bkgdhrs);
+diffMA = abs(hrMA-dataorig);
+[diffMAlocs,~] = movingavgfilt(locm,secbtwsamples,bkgdhrs);
+dataorig = locm;
+%here to top
+absoluteminperiod = 3;
+clear minperiod
+minperiod = absoluteminperiod*60/secbtwsamples;%#samples for compare
+%% N^2 Calculation on an instantaneous basis (filtered to as much as the minutes data for the smaller window
+% one value of N^2 per depth per time
+%drho_dz = alpha*dT/dz
+%N^2 = -g/rho_o*drho/dz
+g = 9.81;       %[m/s^2] gravity
+rhoref = 1026;  %[kg/m^3] reference density at P=0dbar, T=10degC, S=33.8
+Tref=10;        %[deg C] reference Temperature for ref density
+alpha = 2.1e-4; %thermal expansion coefficient
+temp = tempdat;
+density = rhoref*(1 - alpha*(tempdat-Tref));%tempdat is original data
+diffdensity =density - circshift(density,-1);%subtracting the one below it
+%divide by the vertical distance between the two subtracted
+distance = depthsorig-circshift(depthsorig,-1); %DEPTHSORIG MUST BE A COLUMN VECTOR
+%get rid of last value, which will be crap (higher vals give a better approx of actual N^2)
+%diffdensity=diffdensity(1:end-1,:); distance=distance(1:end-1);
+diffdensity(end,:)=diffdensity(end-1,:); distance(end)=distance(end-1);
+drhodz = 0*diffdensity;% new matrix
+for i=1:size(drhodz,2)%length
+    drhodz(:,i) = diffdensity(:,i)./distance;%
+end
+N = sqrt(-g/rhoref*drhodz); %calculate instantaneous stratification
+Ndat = round(1./N); %buoyancy frequency
+
+%% convert buoyancy freq data to number of points to check on either side for local max/min
+%%add leeway to catch waves that might be slightly higher frequency 1/18/12
+Ndat= Ndat.*0.5;
+%data for each depth
+Nps = round(Ndat./secbtwsamples);
+Nps = [Nps(1,:); Nps]; %pad the top with another of the same value because linear interpolation doesn't allow extrapolation
+%% get the depths for interpolation too
+Ndepths = [depthsorig(1); depthsorig - distance./2]; %subtract half the space distance between points, pad at top
+Ndepths(end) = depthsorig(end)-distance(end-1); %fudge the bottom guy too, also well-mixed
+%% interpolate the N data onto the same size as the temp
+Npoints = dataorig;
+indices = 1:length(contourlevels);
+for i = 1:size(dataorig,2) %for each time
+    isolocs = dataorig(~isnan(dataorig(:,i))); %just take the nonzero, non-nan values
+    nolocs = indices(isnan(dataorig(:,i))); %this is where there are no location values
+    Npointstime = Nps(:,i); %what N is in number of points at this time, in depths
+    % linearly interpolate these values as a lookup table type thing
+    Nvector = interp1(Ndepths,Npointstime,isolocs,'linear'); %top of the isotherm depths might go beyond the actual top, linear doesn't extrap
+    Nvector = round(Nvector);
+    %now figure out where they go, in order
+    check = Npoints(:,i);
+    m=1;
+    for k=1:length(check)%for each value
+        if ~isnan(Npoints(k,i)) %this is actually a value
+            %hardwire the minimum period in here 02/08/12
+            if Nvector(m)<=minperiod
+                Npoints(k,i)= minperiod;
+            else
+                Npoints(k,i) = Nvector(m); %this might be backwards in terms of order.
+            end
+            m=m+1; %go "up" one more
+        end
+    end
+    
+end
+%% calculate time difference of depth at each location
+onetimebehind = circshift(dataorig,[0,1]);
+tdiffD = dataorig-onetimebehind; %time difference of temperature at a given depth
+%% find local min and max values of the temperature field (all of it)
+%the max values will be the mins overall, and vice versa, so change the
+%order:
+[minindices, maxindices, minvals, maxvals] = localmaxima_minima_withwindowing_wmean(dataorig, Npoints,2, 2, 1); %gives the
+%this should also work for changes in depth at a point tho min depth ~ max
+%temp... 
+%these are sparse matrices with values at the indices where there is a min
+%or max; indices just has the number of the index where it is; vals are the
+%actual temperature at that location and time.
+%note max and minindices are NOT sparse, and ONLY contain the number of
+%max/mins as their lengths
+maxis=maxindices; maxis(maxis==0)=NaN;
+minis = minindices; minis(minis==0)=NaN;
+maxvs=maxvals; maxvs(maxvs==0)=NaN;
+minvs = minvals; minvs(minvs==0)=NaN;
+
+%% Only keep the time as a minimum/maximum if it shows up in multiple places (how many ???)
+%since extrema are found from changes at each depth, it is valid to assume
+%changes due to a passing internal wave should show up at multiple sites.
+%this can be edited to exclusively use thermistors in the thermocline by
+%defining a cutoff N^2 and using only those (ie, bottom boundary layer
+%effects should be neglected)
+%KEEP MINIS AND MAXIS AS PRIMARY DATASETS FOR PRODDING/USE
+
+%create placeholder variables
+maxima = zeros(1,size(dataorig,2));
+minima = maxima;%pre-allocate (next 9 lines)
+maxavg = maxima;
+minavg = minima;
+timesmin = NaN*minis;
+timesmax=NaN*maxis;
+distancefrommeanmin = minima;
+distancefrommeanmax = maxima;
+isotherms=1:1:size(minis,1);
+Emin=minima; Emax=maxima; %these will hold the half-displacement from the bkgd for the "error bars" to be displayed
+ebarvalmin=minima;
+j=1; k=1; %min and max counters, resp
+for i=1:size(minis,2) %each time
+    onetime = minis(:,i);%data from this time, all depths
+    realdata=isotherms(~isnan(onetime)); %these are indices
+    if length(realdata) >=2
+        %this is cutoff; if fewer then discard
+        timesmin(:,i)=onetime;
+        minima(i) = 12;
+        bkgd = diffMAlocs(:,i);
+        dat=dataorig(:,i);
+        distancefrommeanmin(i)=12-dat(10);
+        Emin(i) = abs(distancefrommeanmin(i)/2);
+        ebarvalmin(i)=minima(i)-Emin(i);
+    else
+        minis(:,i)=NaN*onetime;%replace values with all NaNs
+        minvs(:,i)=NaN*onetime;
+    end
+end
+%% if we're missing minima, this generally catches them- second pass
+for i=1:size(minis,2) %each time
+    onetime = minis(:,i);
+    realdata=onetime(~isnan(onetime));
+    if length(realdata) >=2
+        %this is cutoff; if smaller then discard
+        timesmin(:,i)=onetime;
+        minima(i) = 12;%arbitrary value; assigned for ease of plotting
+    else  %not useful/ not a real point
+        minis(:,i)=NaN*onetime;%replace values with all NaNs
+        minvs(:,i)=NaN*onetime;
+    end
+end
+for i=1:size(maxis,2) %each time
+    onetime = maxis(:,i);
+    realdata=isotherms(~isnan(onetime));
+    if length(realdata) >=2
+        %this is cutoff; if smaller then discard
+        timesmax(:,i)=onetime;
+        maxima(i)=12;
+        bkgd = diffMAlocs(:,i);
+        dat=dataorig(:,i);
+        distancefrommeanmax(i)=12-dat(5);
+        Emin(i) = distancefrommeanmax(i)/2;
+    else
+        maxis(:,i)=NaN*onetime;%replace values with all NaNs
+        maxvs(:,i)=NaN*onetime;
+    end
+end
+%one more absolute filter
+%wish didn't have to do this, but based on observational waves
+onem = circshift(maxima,[0 -1]);
+diffm = onem-maxima;
+halfperiod = round(minperiod/2); %number of times before local min
+timecounter = 1; %reset
+minima(minima==0)=NaN;
+maxima(maxima==0)=NaN;
+minins = minima;
+maxins = maxima;
+indices = 1:1+minperiod;
+m=1;n=1;
+while timecounter<=(length(timeorig)-minperiod) %go through each time (column)
+    if minima(timecounter)==12 %there actually is a minimum here, stop at this one
+        %look after it for clumped minima
+        shorter = minima(timecounter:timecounter+minperiod);
+        shorter = indices(~isnan(shorter));
+        if length(shorter)>=2
+            shorter=shorter+timecounter; %actual time indices
+            displs = abs(locm(:,shorter)-locMAm(:,shorter));
+            % to get maximum displacements of temp from bkgd
+            displs1= nanmax(displs,1);%trying to get a mean displacement to determine which is "larger"
+            maxdispls = nanmax(displs,2);% find the maximum of the mean displacements to determine which is bigger
+            %above will be useful later in calibrating models
+            %at each time find max displacement from background
+            [val, actualmax]=nanmax(displs1);
+            Eminholder = displs1(actualmax)/2;%value for error bar
+            actualmax = shorter(actualmax); %location of actual maximum (minimum)
+            minima(timecounter:timecounter+minperiod)=NaN;%reassign minima at this time to be NaN because found minima
+            minima(actualmax)=12; %assign actual maximum displacement; arbitrary value assigned for ease of plotting
+            Emin(timecounter:timecounter+minperiod)=NaN;%reassign error bar also
+            Emin(actualmax)=Eminholder; %assign actual error bar location
+            ebarvalmin(timecounter:timecounter+minperiod)=NaN;
+            ebarvalmin(actualmax)=12-Eminholder;
+            c=minindices(:,m);
+            minins(n)=nanmax(c); n=n+1;m=m+1;
+            timecounter = actualmax+1; %reset to be the last value you got, not the first value, and start again.
+        else
+            timecounter = timecounter+minperiod;
+            m=m+1;
+        end
+    else
+        timecounter=timecounter+1;%add one to the time counter (next time)
+    end
+end
+%do the same secondary filtering for maxima
+timecounter = 1; m=1;
+while timecounter<=length(timeorig)-minperiod %go through each one; max
+    %clear shorter
+    if maxima(timecounter)==12 %there actually is a maximum here, stop at this one
+        %look after it for clumped minima
+        shorter = maxima(timecounter:timecounter+minperiod);
+        shorter = indices(~isnan(shorter));
+        if length(shorter)>=2
+            shorter=shorter+timecounter; %actual time indices
+            displs = diffMA(:,shorter); %this might not work; trying to get maximum displacements of temp from bkgd
+            displs = mean(displs,1);
+            maxdispls = nanmax(displs,1);%at each time find max displacement from background
+            [val,actualmax] = max(maxdispls); %gives absolute index of relative index of max displacement (should work for min too)
+            actualmax = shorter(actualmax);
+            maxima(timecounter:timecounter+minperiod)=NaN;
+            maxima(actualmax)=12;
+            maxins(n)=nanmax(maxins(:,m)); n=n+1;m=m+1;
+            timecounter = timecounter+minperiod;
+        else
+            timecounter = timecounter+minperiod;
+            m=m+1;
+        end
+    else
+        timecounter=timecounter+1;
+    end
+end
+maxima(maxima==0)=NaN;
+minima(minima==0)=NaN;
+for i=1:length(minima)
+    if isnan(minima(i))
+        Emin(i)=NaN;
+        ebarvalmin(i)=NaN;
+    elseif ~isnan(minima(i)) && isnan(Emin(i))
+        r=12 %THIS IS A CHECK
+    end
+end
+% figure; contourf(timeorig, depthsorig, CJTherms(:, mintime:maxtime), contourlevels); shading flat; colorbar; hold on;
+% plot(timeorig, minima,'ko'); hold on; h=errorbar(timeorig,ebarvalmin,abs(Emin),'k'); errorbar_tick(h,600);
+%% calculate periods of these waves
+indices = 1:length(timeorig);
+mintimes = indices(~isnan(minima));
+maxtimes = indices(~isnan(maxima));
+minperiod = mintimes-circshift(mintimes,[0 1]); %subtracting one behind
+maxperiod = maxtimes-circshift(maxtimes,[0 1]);
+minperiod = minperiod/permin;%gives period in minutes
+maxperiod = maxperiod/permin;
+minperiods = minima; maxperiods = maxima;
+j=1;k=1;
+for i=1:length(minima)
+    if minima(i)==12
+        minperiods(i) = minperiod(j);
+        j=j+1;
+    end
+    if maxima(i) ==12
+        maxperiods(i) = maxperiod(k);
+        k=k+1;
+    end
+    
+end
+maxperiods(1:3) = 0;
+minperiods(1:3) = 0;
+
+    function [disploc, displamt, locm, locMAm] =IsothermDisplacements(datain, xdat, ydat,secbtwsamples,hrsforbackground,minforcompare,contourlevels)
+        %disploc and displamt are two calculations of displacement from n-hour
+        %background, they should match but may not;
+        % locm is the location matrix holding locations of each contourlevel at
+        % each time (contourlevels and xdat should be used in the future)
+        %Calculate a background location of isotherms based on an X-hour (hrsforkbkgd) moving
+        %average filter. Calculate displacement of actual isotherm locations from
+        %this background at each time step.
+        %% Define Data Set
+        timeorig2 = xdat;%time
+        dataorig2 = datain;%temperature
+        hrsforbkgd2 = hrsforbackground; %moving average filter size
+        %% Calculate Moving Average (Background) Values of Temperature and get Contours
+        [hrMA2,~]=movingavgfilt(dataorig2,secbtwsamples,hrsforbkgd2);
+        
+        %% Calculate the filtered data for a couple of minutes
+        %essentially smoothing the data to pick out 10min periods
+        %this can be commented out if raw location is desired (given accuracy of
+        %thermistors, this is probably okay, I just chose 5min for IW smoothing)
+        [minMA,~]=movingavgfilt(dataorig2, secbtwsamples, minforcompare/60);
+        dataorig2 = minMA;
+        
+        % get contours from orig data
+        [numisotherms, temp2,loc,~,~] = contoursort(datain,contourlevels,ydat,1,1); %1 is to sort and only one value per temp!
+        %% get contours from MA filtered data
+        [~, tempMA,locMA,~,~] = contoursort(hrMA2,contourlevels,ydat,1,1); %1 is to sort and only one value per temp!
+        
+        %% Calculate displacements of isotherms
+        %make sure these are the same temperatures and they line up
+        locm = zeros(length(contourlevels),length(timeorig2));
+        locMAm = locm; %these will be locations of the final isotherms; if they don't exist the difference will be zero, which is good
+        displamt = locm; %this will record the displacement for each isotherm
+        tempm=locm;
+        for i2=1:length(timeorig2)
+            clear c2
+            clear cm
+            clear disp
+            clear locms
+            c2(:,1) = loc(~isnan(loc(:,i2)),i2);
+            c2(:,2) = temp2(~isnan(temp2(:,i2)),i2);
+            cm(:,1) = locMA(~isnan(locMA(:,i2)),i2);
+            cm(:,2) = tempMA(~isnan(tempMA(:,i2)),i2);
+            if size(c2,1) ~= size(cm,1)
+                %make them the same size
+                [~,ic,icm] = intersect(c2(:,2),cm(:,2)); %find which temperatures are the same;
+                %ic is indices of c & icm is indices of cm that are same vals
+                %want to keep only these ones and keep them matched
+                c2 = c2(ic,:); %original
+                cm = cm(icm,:); %background
+            end
+            %calculate displacement from background
+            disp = cm-c2; %this is displacement from background
+            for jj = 1:length(contourlevels)
+                for kk =1:size(c2,1) %for each temperature that exists
+                    if c2(kk,2) == contourlevels(jj) %if the temperature matches the jth contourlevel
+                        locm(jj,i2) = c2(kk,1); %keep the location for this temperature in the big matrix, should match for background too
+                        locMAm(jj,i2) = cm(kk,1);%this isn't actually needed as displamt is now in the for loop, but might be useful later.
+                        displamt(jj,i2)= disp(kk,1);
+                        tempm(jj,i2)=c2(kk,2);
+                    end
+                end
+            end
+        end
+        
+        %% Calculate diplacement of each isotherm from its background value
+        disploc = locm-locMAm; %these should be the same size
+        locm(locm==0)=NaN; %get NaNs, not zeros, for all of the nonexistent isotherms
+        locMAm(locMAm==0)=NaN;
+    end
+    function [meandat, perturbdat] = movingavgfilt(datamtx, secbtwsamples, filterlengthhr )
+        %movingavgfilt moving average filter applied to a timeseries of data
+        %requires sampling frequency (seconds between samples); length of filter
+        %for moving average in hours
+        %day= 86400sec; 12hr= 43200 sec; 6hr= 21600 sec; 2hr=7200sec;
+        %mavg is the actual mean data; perturbdat is the perturbation from
+        %that mean; meandat is the filtered data (the means)
+        s=3600/secbtwsamples; %number of samples in an hour, eg 10 = 360 samples in an hour
+        l=filterlengthhr*s;%number of samples in each MA filter chunk
+        denom = (ones(1,l))/l; %create a filter of length l, weighted equally (see numerator coeffs)
+        %num= ones(1,l);
+        num=1; %02/10/12
+        %filter works on the columns of a matrix, so if it is fatter than tall (given usual temp timeseries data),
+        %perform filtering on transpose
+        if size(datamtx,1) <= size(datamtx,2) %in timeseries, almost always #of timesamples># samplers
+            datamtx=datamtx';
+            flag=1;
+        end
+        mavg=filtfilt(denom, num, datamtx);%creates the perturbation data
+        meandat = mavg;%these are the means
+        perturbdat = datamtx-mavg; %mavg is the actual moving average filtered data 06/05/2011
+        %return to original orientation for ease of use
+        if flag ==1;
+            perturbdat=perturbdat';
+            meandat=meandat';
+        end
+    end
+    function [numisotherms, temp, loc, tempsortindex, locsortindex] = contoursort(therms, isovals, depthvec, sortflag, oneflag)
+        %This function finds the locations of given isotherms/isopycnals
+        %in space (y) at each time(x), utilizing linear interpolation when
+        %contours lie between measurements (appropriate for most stable
+        %water columns; interpolation scheme can be changed as desired)
+        %therms = original data; isovals = contour levels you want to get out;
+        %depthvec = original depths of data input; sortflag = tells you whether to
+        %sort or not; same for oneflag, just a second check(?)
+        %calculate locations of isotherms using linear interpolation method.
+        %therms = n x m, n depths by m times; SORTflag is indication of whether to
+        %sort isotherms or not. if SORTflag is 1, then sorting will occur so
+        %monotonically increasing. if not, no sorting. if oneflag =1, only one
+        %location per isotherm will be recorded.
+        %%% THIS WILL NOT WORK WHEN THERE ARE NaNs IN THE DATA!
+        mm=size(therms, 2);%times
+        nn=size(therms, 1); %depths
+        s = length(isovals);
+        loc = zeros(round(s*4), mm); %isovals x m matrix with one spot for each
+        temp = loc;%placeholder
+        locsortindex = loc;%placeholder
+        tempsortindex = loc;%placeholder
+        numisotherms = zeros(1,mm); % number of isotherms found at a given time
+        
+        for ii= 1:mm %each time
+            ts = 1; %reset the indicator increasing number of isotherms found
+            for jj=1:nn-1% each isotherm
+                gg = therms(jj,ii); % take this isotherm
+                hh = therms(jj+1,ii); % and the one above it in space
+                if gg>=hh % if there is an overturn
+                    less= find(isovals <=gg);
+                    more = find(isovals>=hh); %these are the isovals that are greater than lower isotherm ie 11.25 11.5 11.75....
+                    indices2 = intersect(less, more);
+                elseif hh>=gg %normally, the one "above" is higher temp
+                    less= find(isovals <=hh);
+                    more = find(isovals>=gg);
+                    indices2 = intersect(less, more); %indices of isotherms that exist in between these two points
+                end
+                if exist('indices2','var')
+                    indices2 = isovals(indices2); %get the actual values!
+                    if length(indices2)>=1 && gg~=hh
+                        heights = interp1([gg hh],[depthvec(jj) depthvec(jj+1)],indices2);
+                        for kk = 1:length(heights)
+                            loc(ts,ii) = heights(kk);
+                            temp(ts,ii) = indices2(kk);
+                            ts =ts+1;%there is now one more value in the vector!
+                        end
+                    else
+                        % you don't have any resolution of any isotherms between data
+                        % points
+                    end
+                end
+                clear heights indices2
+            end
+            numisotherms(ii) = ts;
+            loc((loc(:,ii)==0),ii)=NaN;
+            temp((temp(:,ii)==0),ii)=NaN;
+            if sortflag ==1
+                [loc(:,ii),locsortindex(:,ii)] = sort(loc(:,ii),1,'ascend');
+                [temp(:,ii),tempsortindex(:,ii)] = sort(temp(:,ii),1,'ascend');
+            end
+            if oneflag ==1 %this will automatically re-sort the data, so even if sorted not chosen the first time, it will be later.
+                for kk = 1:ts
+                    tem = temp(kk,ii);%take out this temperature
+                    number = temp(:,ii)==temp(kk,ii); %indices of matching temp
+                    if number>1
+                        hs = loc(number,ii);%values of location for this multiple-loc temp
+                        ht = mean(hs); %mean location of this temp (if sorted first, the middle location, otherwise a little random)
+                        other = temp(:,ii)~=temp(kk,ii); % indices of all other temps besides the matching ones
+                        hs = loc(other,ii); % locations of non-identical temps
+                        temp(1:length(other),ii)= temp(other); %replace temp with all of them
+                        temp(length(other)+1,ii) = tem; % tack on this other at the end
+                        loc(1:length(hs), ii) = loc(hs); %replace loc with all of the non-identical temp locs
+                        loc(length(hs)+1,ii) = ht; %tack on the mean value at the end
+                    end
+                    % now you have an un-ordered dataset so re-order (could replace
+                    % with code to find the correct location and make sure they fit
+                    % in together here)
+                    loc(:,ii) = sort(loc(:,ii),1,'ascend');
+                    temp(:,ii) = sort(temp(:,ii),1,'ascend');
+                end
+            end
+            
+        end
+    end
+    function [maxindices, minindices, maxvals, minvals] = localmaxima_minima_withwindowing_wmean(inputdata, windowingdata, flag, filtflag, dimension,  varargin)
+        %note: embedded indices match indices in the main function; this is okay because
+        %this function is a script line call, not in any loops
+        % This function determines local minima and maxima, with the option
+        % of using a known window size to look for them. This is useful for
+        % known approximate periods of waves. Utilizes changes in slope of
+        % temperature contours to determine max and mins.
+        %
+        %If data is matrix, flag=2; if a vector, flag=1; ptsforfilter; dimension is
+        %the one you want to average over (ie time, use dimension =1);
+        %windowingdata is the same size as the inputata and tells the number of
+        %points that should be checked around (will be divided by two) the actual
+        %value to determine if significant extremum
+        %timeseries(maxindices) will give the times of maximum values!
+        %% Calculate change in value over time (ddata/dspacing)
+        %%%%%%%note: the last column values should be ignored because the previous value is the first time value
+        %%% also, note that ignoring a few datapoints on the ends in huge
+        %%% datasets for ease of use does not make a difference here.
+        if flag ==1 %vector
+            % vector input
+            clear maxindices
+            clear minindices
+            %we actually don't care about the real d/dt bc delta time is the same
+            if filtflag == 1%want filter on data
+                nume=ones(1,ptsforfilter)/ptsforfilter; %filter data
+                filtdata = filter(nume,1,ddatadt);
+                %equal weighting of this size
+                ddatadt = filtdata;
+            end
+            maxvals = 0*inputdata; %start with zeros, replace with 1 if min or max there
+            minvals = 0*inputdata;
+            maxindices = maxvals;
+            minindices = minvals;
+            k=1;%mincounter
+            l=1;%maxcounter
+            for j = 2:length(inputdata) %don't want the first one bc it's subtracting the last value
+                window = windowingdata(j);
+                window = round(window/2);
+                if abs(ddatadt(j))>1000 %this is impossible; skip it.
+                    %else if it changes sign of slope, is max or min; count j even
+                    %though it'll be between this and the previous time.
+                elseif ddatadt(j-1)<0 && ddatadt(j)>0%min
+                    if inputdata(j) <= min(inputdata(j-window:j+window))
+                        minvals(j) = inputdata(j);
+                        minindices(k) =j;
+                        k=k+1;
+                    end
+                elseif ddatadt(j-1)>0 && ddatadt(j)<0%max
+                    if inputdata(j) >= max(inputdata(j-window:j+window))
+                        maxvals(j) = inputdata(j);
+                        maxindices(l)=j;
+                        l=l+1;
+                    end
+                end
+            end
+            m=find(minindices>0,1,'last');
+            minindices = minindices(1:m);%index of minimum
+            m=find(maxindices>0,1,'last');
+            maxindices = maxindices(1:m);%index of maximum
+        else %not vector, have matrix of data (FAR MORE LIKELY)
+            clear maxindices
+            clear minindices
+            %matrix input
+            if dimension == 2 %averaging over columns
+                oneafter = circshift(inputdata, [0 -1]);
+                ddatadt = (oneafter - inputdata);
+                avgindex = 1;
+                indepindex = 2;
+                if filtflag == 1
+                    filtdata = 0*ddatadt;
+                    for i=1:size(ddatadt,1)
+                        %number of points in each average = pts for filt
+                        nume=ones(1,ptsforfilter)/ptsforfilter;
+                        filtdata(i,:) = filter(nume,1,ddatadt(i,:));
+                        %equal weighting of this size
+                    end
+                    ddatadt = filtdata;
+                end
+            elseif dimension ==1 %% average over rows; this is one for isotherms
+                oneafter = circshift(inputdata, [0 -1]);
+                ddatadt = (oneafter - inputdata);
+                avgindex=2; %index you're averaging all of
+                indepindex=1; %index you're averaging over
+                if filtflag == 1%you're filtering the data you have in time; seldom used
+                    filtdata = 0*ddatadt;
+                    for i=1:size(ddatadt,2)
+                        %number of points in each average = pts for filt
+                        nume=ones(1,ptsforfilter)/ptsforfilter;
+                        filtdata(:,i) = filter(nume,1,ddatadt(:,i));
+                        %equal weighting of this size
+                    end
+                    ddatadt = filtdata;
+                end
+            else
+                msgbox('error! we can only do up to 2 dimensions');
+            end
+            %initialize
+            maxvals = 0*inputdata; %start with zeros, replace with 1 if min or max there
+            minvals = 0*inputdata;
+            maxindices = maxvals;
+            minindices = minvals;
+            %% look at each vector of data and window, then look for slope-based inflections
+            for i=1:size(inputdata,indepindex)
+                if avgindex == 1 %take the column
+                    d1 = ddatadt(:,i);%this is your ddt data
+                    window = round(windowingdata(:,i)./2);%halfwindow width
+                    indat = inputdata(:,i); %this is original data
+                elseif avgindex == 2 %take the row vector
+                    d1 = ddatadt(i,:);
+                    window = round(windowingdata(i,:)./2);
+                    indat = inputdata(i,:);
+                end
+                minvs = 0*d1; minins=0*d1; maxvs=0*d1;maxins=0*d1;
+                for j = 4:size(inputdata,avgindex)-3%so doesn't exceed dimensions
+                    %else if it changes sign of slope, is max or min; count j even
+                    %though it'll be between this and the previous time.
+                    if j-window(j)>=1 && j+window(j)<=size(inputdata,avgindex)
+                        % make sure the window does not exceed the possible length of
+                        % the vector
+                        if d1(j-1)<0 && d1(j)>0%max because cold water coming up, or min for locations
+                            if indat(j) == min(indat((j-window(j)):(j+window(j))))&& indat(j)<=mean(indat((j-window(j)):(j+window(j)))) %minimum temperature at a max!!!
+                                maxvs(j) = indat(j);
+                                maxins(j) =j;
+                            end
+                        elseif d1(j-1)>0 && d1(j)<0%min because cold water going down, or max for locations because highest point
+                            if indat(j) == max(indat(j-window(j):j+window(j))) && indat(j) >= mean(indat(j-window(j):j+window(j)))
+                                minvs(j) = indat(j);
+                                minins(j)=j;
+                            end
+                        elseif abs(d1(j))<=0.001 %very little change
+                            before=mean(d1(j-3:j-1)); %starting data point
+                            after=mean(d1(j+1:j+3)); %ending data point
+                            if before<0 && after>0%max for temp, min for locations
+                                if indat(j) == min(indat(j-window(j):j+window(j))) && indat(j)<=mean(indat((j-window(j)):(j+window(j))))
+                                    maxvs(j) = indat(j);
+                                    maxins(j) =j;
+                                end
+                            elseif before>0 && after<0 %min for temp, max for locations
+                                if indat(j) == max(indat(j-window(j):j+window(j))) && indat(j) >= mean(indat(j-window(j):j+window(j)))
+                                    minvs(j) = indat(j);
+                                    minins(j)=j;
+                                    %l=l+1;
+                                end
+                                %no inflection here, so no max or min.
+                            end
+                        end
+                    end
+                end
+                %report correct dimensions of data
+                if avgindex ==1 %vector
+                    maxvals(:,i)=maxvs;
+                    maxindices(:,i)=maxins;
+                    minvals(:,i) = minvs;
+                    minindices(:,i)=minins;
+                elseif avgindex==2 %matrix
+                    maxvals(i,:)=maxvs;
+                    maxindices(i,:)=maxins;
+                    minvals(i,:) = minvs;
+                    minindices(i,:)=minins;
+                end
+            end
+        end
+    end
+end
